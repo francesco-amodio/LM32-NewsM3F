@@ -1,0 +1,25 @@
+# Ambiente virtuale Python
+.venv/
+
+# Cache e file temporanei Python
+__pycache__/
+*.py[cod]
+
+# Dataset e cache preprocessate
+data/
+cache/
+
+# Modelli, checkpoint e risultati
+checkpoints/
+outputs/
+*.pt
+*.pth
+
+# Variabili d'ambiente e credenziali
+.env
+
+# File di sistema/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
