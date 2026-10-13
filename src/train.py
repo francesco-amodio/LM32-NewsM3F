@@ -1,8 +1,11 @@
-"""Training single-process e validazione del classificatore News-M3F."""
+"""Training e validazione del classificatore News-M3F."""
 
 import argparse
+import json
 import math
 import random
+import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -12,12 +15,14 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from src.data import load_preprocessed_data, make_collate_fn
-from src.model import NewsClassifier
+from src.model import EMBEDDING_DIM, NewsClassifier
 
 
 RANDOM_SEED = 42
 
-BATCH_SIZE = 64
+# Nel training single-process il batch globale coincide con il batch locale.
+# In DDP manterremo lo stesso batch globale: 64 esempi per ciascuno dei 2 worker.
+DEFAULT_BATCH_SIZE = 128
 VALIDATION_BATCH_SIZE = 128
 
 LEARNING_RATE = 1e-3
@@ -25,12 +30,18 @@ WEIGHT_DECAY = 1e-4
 
 PREDICTION_THRESHOLD = 0.50
 
-# Per ora eseguiamo un test breve.
-SMOKE_TEST_BATCHES = 100
+DEFAULT_MAX_EPOCHS = 8
+EARLY_STOPPING_PATIENCE = 2
+MIN_IMPROVEMENT = 0.001
+MIN_EPOCHS_BEFORE_STOPPING = 4
+
+OUTPUT_DIR = Path("outputs")
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+METADATA_DIR = OUTPUT_DIR / "metadata"
 
 
 def parse_args():
-    """Legge da riga di comando la configurazione candidata da testare."""
+    """Legge i parametri principali dell'esperimento."""
 
     parser = argparse.ArgumentParser(
         description="Training del classificatore News-M3F."
@@ -47,6 +58,20 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=DEFAULT_MAX_EPOCHS,
+        help="Numero massimo di epoche.",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="Dimensione del batch di training.",
+    )
+
     return parser.parse_args()
 
 
@@ -59,15 +84,13 @@ def set_random_seed(seed):
 
 
 def compute_positive_counts(train_dataset, num_classes):
-    """Conta gli esempi positivi per ciascuna delle classi."""
+    """Conta gli esempi positivi per ogni classe."""
 
     positive_counts = np.zeros(
         num_classes,
         dtype=np.int64,
     )
 
-    # Le label sono vettori binari di 90 elementi.
-    # Sommando i vettori otteniamo il numero di positivi per classe.
     for labels in train_dataset["labels"]:
         positive_counts += np.asarray(
             labels,
@@ -78,7 +101,7 @@ def compute_positive_counts(train_dataset, num_classes):
 
 
 def build_loss_function(candidate, train_dataset, num_classes):
-    """Costruisce la loss corrispondente al candidato A, B o C."""
+    """Costruisce la BCE corrispondente al candidato A, B o C."""
 
     if candidate == "A":
         return nn.BCEWithLogitsLoss(), None
@@ -91,8 +114,6 @@ def build_loss_function(candidate, train_dataset, num_classes):
     total_examples = len(train_dataset)
     negative_counts = total_examples - positive_counts
 
-    # Evitiamo divisioni per zero; nel nostro dataset le classi
-    # selezionate hanno comunque tutte esempi positivi.
     safe_positive_counts = np.maximum(
         positive_counts,
         1,
@@ -106,11 +127,8 @@ def build_loss_function(candidate, train_dataset, num_classes):
         weights = full_weights
 
     elif candidate == "C":
-        # La radice quadrata attenua l'effetto dei pesi molto elevati,
-        # mantenendo comunque maggiore attenzione sulle classi rare.
-        weights = np.sqrt(full_weights).astype(
-            np.float32
-        )
+        # La radice quadrata attenua i pesi estremi del candidato B.
+        weights = np.sqrt(full_weights).astype(np.float32)
 
     else:
         raise ValueError(
@@ -123,28 +141,26 @@ def build_loss_function(candidate, train_dataset, num_classes):
     )
 
     return (
-        nn.BCEWithLogitsLoss(
-            pos_weight=pos_weight
-        ),
+        nn.BCEWithLogitsLoss(pos_weight=pos_weight),
         pos_weight,
     )
 
 
-def train_smoke_test(
+def train_one_epoch(
     model,
     loader,
     optimizer,
     loss_function,
+    epoch_number,
 ):
-    """Esegue un breve training per verificare l'intera pipeline."""
+    """Esegue una singola epoca completa di training."""
 
     model.train()
-    total_loss = 0.0
 
-    for batch_index, batch in enumerate(
-        loader,
-        start=1,
-    ):
+    total_loss = 0.0
+    total_examples = 0
+
+    for batch_index, batch in enumerate(loader, start=1):
         optimizer.zero_grad()
 
         logits = model(
@@ -160,23 +176,23 @@ def train_smoke_test(
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item()
+        batch_size = batch["labels"].shape[0]
 
-        if batch_index % 20 == 0:
-            average_loss = (
-                total_loss / batch_index
-            )
+        total_loss += loss.item() * batch_size
+        total_examples += batch_size
+
+        # Stampiamo un aggiornamento periodico senza produrre
+        # una riga di log per ogni singolo batch.
+        if batch_index % 100 == 0:
+            current_average = total_loss / total_examples
 
             print(
-                f"Batch {batch_index:3d} | "
-                f"Loss corrente: {loss.item():.4f} | "
-                f"Loss media: {average_loss:.4f}"
+                f"Epoca {epoch_number} | "
+                f"Batch {batch_index}/{len(loader)} | "
+                f"Loss media: {current_average:.4f}"
             )
 
-        if batch_index >= SMOKE_TEST_BATCHES:
-            break
-
-    return total_loss / batch_index
+    return total_loss / total_examples
 
 
 def evaluate_model(
@@ -185,7 +201,7 @@ def evaluate_model(
     loss_function,
     threshold=PREDICTION_THRESHOLD,
 ):
-    """Valuta il modello senza modificare i parametri."""
+    """Valuta il modello sull'intero validation set."""
 
     model.eval()
 
@@ -194,6 +210,10 @@ def evaluate_model(
 
     all_targets = []
     all_predictions = []
+
+    probability_sum = 0.0
+    probability_count = 0
+    maximum_probability = 0.0
 
     with torch.no_grad():
         for batch in loader:
@@ -209,13 +229,18 @@ def evaluate_model(
 
             batch_size = batch["labels"].shape[0]
 
-            total_loss += (
-                loss.item() * batch_size
-            )
+            total_loss += loss.item() * batch_size
             total_examples += batch_size
 
-            probabilities = torch.sigmoid(
-                logits
+            probabilities = torch.sigmoid(logits)
+
+            # Questi valori diagnostici ci aiutano a capire se un modello
+            # è vicino alla soglia anche quando non produce ancora positivi.
+            probability_sum += probabilities.sum().item()
+            probability_count += probabilities.numel()
+            maximum_probability = max(
+                maximum_probability,
+                probabilities.max().item(),
             )
 
             predictions = (
@@ -232,59 +257,100 @@ def evaluate_model(
                 .cpu()
             )
 
-    targets = torch.cat(
-        all_targets
-    ).numpy()
-
-    predictions = torch.cat(
-        all_predictions
-    ).numpy()
-
-    validation_loss = (
-        total_loss / total_examples
-    )
-
-    micro_f1 = f1_score(
-        targets,
-        predictions,
-        average="micro",
-        zero_division=0,
-    )
-
-    macro_f1 = f1_score(
-        targets,
-        predictions,
-        average="macro",
-        zero_division=0,
-    )
-
-    precision = precision_score(
-        targets,
-        predictions,
-        average="micro",
-        zero_division=0,
-    )
-
-    recall = recall_score(
-        targets,
-        predictions,
-        average="micro",
-        zero_division=0,
-    )
+    targets = torch.cat(all_targets).numpy()
+    predictions = torch.cat(all_predictions).numpy()
 
     return {
-        "validation_loss": validation_loss,
-        "micro_f1": micro_f1,
-        "macro_f1": macro_f1,
-        "precision": precision,
-        "recall": recall,
-        "predicted_positives": int(
-            predictions.sum()
+        "validation_loss": total_loss / total_examples,
+        "micro_f1": f1_score(
+            targets,
+            predictions,
+            average="micro",
+            zero_division=0,
         ),
-        "actual_positives": int(
-            targets.sum()
+        "macro_f1": f1_score(
+            targets,
+            predictions,
+            average="macro",
+            zero_division=0,
         ),
+        "precision": precision_score(
+            targets,
+            predictions,
+            average="micro",
+            zero_division=0,
+        ),
+        "recall": recall_score(
+            targets,
+            predictions,
+            average="micro",
+            zero_division=0,
+        ),
+        "predicted_positives": int(predictions.sum()),
+        "actual_positives": int(targets.sum()),
+        "mean_probability": probability_sum / probability_count,
+        "max_probability": maximum_probability,
     }
+
+
+def save_checkpoint(
+    model,
+    optimizer,
+    candidate,
+    epoch,
+    metrics,
+):
+    """Salva lo stato del miglior modello osservato."""
+
+    CHECKPOINT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    checkpoint_path = (
+        CHECKPOINT_DIR
+        / f"candidate_{candidate}_best.pt"
+    )
+
+    torch.save(
+        {
+            "candidate": candidate,
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "metrics": metrics,
+        },
+        checkpoint_path,
+    )
+
+    return checkpoint_path
+
+
+def save_metadata(candidate, metadata):
+    """Salva configurazione e risultati dell'esperimento in JSON."""
+
+    METADATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    metadata_path = (
+        METADATA_DIR
+        / f"candidate_{candidate}.json"
+    )
+
+    with metadata_path.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            metadata,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    return metadata_path
 
 
 def main():
@@ -298,12 +364,18 @@ def main():
         config["pad_token_id"]
     )
 
+    # Un generatore esplicitamente inizializzato rende riproducibile
+    # anche l'ordine casuale degli esempi nel DataLoader.
+    train_generator = torch.Generator()
+    train_generator.manual_seed(RANDOM_SEED)
+
     train_loader = DataLoader(
         dataset["train"],
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=0,
+        generator=train_generator,
     )
 
     validation_loader = DataLoader(
@@ -320,12 +392,10 @@ def main():
         pad_token_id=config["pad_token_id"],
     )
 
-    loss_function, pos_weight = (
-        build_loss_function(
-            args.candidate,
-            dataset["train"],
-            config["num_classes"],
-        )
+    loss_function, pos_weight = build_loss_function(
+        args.candidate,
+        dataset["train"],
+        config["num_classes"],
     )
 
     optimizer = AdamW(
@@ -334,82 +404,209 @@ def main():
         weight_decay=WEIGHT_DECAY,
     )
 
-    print("\n=== CONFIGURAZIONE ===")
-    print(f"Candidato: {args.candidate}")
-    print(f"Batch size: {BATCH_SIZE}")
-    print(f"Learning rate: {LEARNING_RATE}")
+    total_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+    )
+
+    metadata = {
+        "candidate": args.candidate,
+        "random_seed": RANDOM_SEED,
+        "batch_size": args.batch_size,
+        "validation_batch_size": VALIDATION_BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "weight_decay": WEIGHT_DECAY,
+        "prediction_threshold": PREDICTION_THRESHOLD,
+        "max_epochs": args.epochs,
+        "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+        "min_improvement": MIN_IMPROVEMENT,
+        "embedding_dim": EMBEDDING_DIM,
+        "vocabulary_size": config["vocabulary_size"],
+        "num_classes": config["num_classes"],
+        "model_parameters": total_parameters,
+        "history": [],
+    }
 
     if pos_weight is None:
-        print("pos_weight: nessuno")
+        metadata["pos_weight"] = None
+    else:
+        metadata["pos_weight"] = {
+            "min": float(pos_weight.min().item()),
+            "max": float(pos_weight.max().item()),
+            "mean": float(pos_weight.mean().item()),
+        }
+
+    print("\n=== CONFIGURAZIONE TRAINING ===")
+    print(f"Candidato:          {args.candidate}")
+    print(f"Epoche massime:     {args.epochs}")
+    print(f"Batch size:         {args.batch_size}")
+    print(f"Training examples:  {len(dataset['train']):,}")
+    print(f"Validation:         {len(dataset['validation']):,}")
+    print(f"Parametri modello:  {total_parameters:,}")
+
+    if pos_weight is None:
+        print("pos_weight:         nessuno")
     else:
         print(
-            f"pos_weight min: "
-            f"{pos_weight.min().item():.2f}"
-        )
-        print(
-            f"pos_weight max: "
+            f"pos_weight:         "
+            f"{pos_weight.min().item():.2f} - "
             f"{pos_weight.max().item():.2f}"
         )
+
+    best_micro_f1 = -1.0
+    best_epoch = 0
+    best_checkpoint = None
+    epochs_without_improvement = 0
+
+    training_start = time.perf_counter()
+
+    for epoch in range(1, args.epochs + 1):
+        epoch_start = time.perf_counter()
+
         print(
-            f"pos_weight medio: "
-            f"{pos_weight.mean().item():.2f}"
+            f"\n=== EPOCA {epoch}/{args.epochs} ==="
         )
 
-    print(
-        f"Batch da eseguire: "
-        f"{SMOKE_TEST_BATCHES}"
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            loss_function,
+            epoch,
+        )
+
+        metrics = evaluate_model(
+            model,
+            validation_loader,
+            loss_function,
+        )
+
+        epoch_seconds = (
+            time.perf_counter() - epoch_start
+        )
+
+        epoch_result = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "validation_loss": metrics["validation_loss"],
+            "micro_f1": metrics["micro_f1"],
+            "macro_f1": metrics["macro_f1"],
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "predicted_positives": metrics["predicted_positives"],
+            "actual_positives": metrics["actual_positives"],
+            "mean_probability": metrics["mean_probability"],
+            "max_probability": metrics["max_probability"],
+            "duration_seconds": epoch_seconds,
+        }
+
+        metadata["history"].append(
+            epoch_result
+        )
+
+        print(f"Training loss:       {train_loss:.4f}")
+        print(
+            f"Validation loss:     "
+            f"{metrics['validation_loss']:.4f}"
+        )
+        print(
+            f"Micro-F1:            "
+            f"{metrics['micro_f1']:.4f}"
+        )
+        print(
+            f"Macro-F1:            "
+            f"{metrics['macro_f1']:.4f}"
+        )
+        print(
+            f"Precision:           "
+            f"{metrics['precision']:.4f}"
+        )
+        print(
+            f"Recall:              "
+            f"{metrics['recall']:.4f}"
+        )
+        print(
+            f"Predizioni positive: "
+            f"{metrics['predicted_positives']:,}"
+        )
+        print(
+            f"Probabilità media:   "
+            f"{metrics['mean_probability']:.4f}"
+        )
+        print(
+            f"Probabilità massima: "
+            f"{metrics['max_probability']:.4f}"
+        )
+        print(
+            f"Durata epoca:        "
+            f"{epoch_seconds:.1f} s"
+        )
+
+        improvement = (
+            metrics["micro_f1"]
+            - best_micro_f1
+        )
+
+        if improvement > MIN_IMPROVEMENT:
+            best_micro_f1 = metrics["micro_f1"]
+            best_epoch = epoch
+            epochs_without_improvement = 0
+
+            best_checkpoint = save_checkpoint(
+                model,
+                optimizer,
+                args.candidate,
+                epoch,
+                metrics,
+            )
+
+            print(
+                "Nuovo miglior modello: "
+                f"checkpoint salvato in {best_checkpoint}"
+            )
+
+        else:
+            epochs_without_improvement += 1
+
+        # Evitiamo che una fase iniziale con Micro-F1 nullo
+        # interrompa troppo presto l'addestramento.
+        if (
+            epoch >= MIN_EPOCHS_BEFORE_STOPPING
+            and epochs_without_improvement
+            >= EARLY_STOPPING_PATIENCE
+        ):
+            print(
+                "\nEarly stopping: nessun miglioramento "
+                "sufficiente della Micro-F1."
+            )
+            break
+
+    total_seconds = (
+        time.perf_counter() - training_start
     )
 
-    print("\n=== TRAINING ===")
-
-    average_loss = train_smoke_test(
-        model,
-        train_loader,
-        optimizer,
-        loss_function,
+    metadata["epochs_completed"] = len(
+        metadata["history"]
     )
-
-    print(
-        f"\nLoss media training: "
-        f"{average_loss:.4f}"
+    metadata["best_epoch"] = best_epoch
+    metadata["best_micro_f1"] = best_micro_f1
+    metadata["best_checkpoint"] = (
+        str(best_checkpoint)
+        if best_checkpoint is not None
+        else None
     )
+    metadata["total_training_seconds"] = total_seconds
 
-    print("\n=== VALIDATION ===")
-
-    metrics = evaluate_model(
-        model,
-        validation_loader,
-        loss_function,
+    metadata_path = save_metadata(
+        args.candidate,
+        metadata,
     )
 
-    print(
-        f"Validation loss:      "
-        f"{metrics['validation_loss']:.4f}"
-    )
-    print(
-        f"Micro-F1:             "
-        f"{metrics['micro_f1']:.4f}"
-    )
-    print(
-        f"Macro-F1:             "
-        f"{metrics['macro_f1']:.4f}"
-    )
-    print(
-        f"Precision (micro):     "
-        f"{metrics['precision']:.4f}"
-    )
-    print(
-        f"Recall (micro):        "
-        f"{metrics['recall']:.4f}"
-    )
-    print(
-        f"Predizioni positive:   "
-        f"{metrics['predicted_positives']:,}"
-    )
-    print(
-        f"Label positive reali:  "
-        f"{metrics['actual_positives']:,}"
-    )
+    print("\n=== TRAINING COMPLETATO ===")
+    print(f"Migliore epoca:   {best_epoch}")
+    print(f"Migliore Micro-F1: {best_micro_f1:.4f}")
+    print(f"Durata totale:     {total_seconds:.1f} s")
+    print(f"Metadata:          {metadata_path}")
 
 
 if __name__ == "__main__":
