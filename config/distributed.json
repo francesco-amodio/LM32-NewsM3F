@@ -1,0 +1,11 @@
+{
+  "backend": "gloo",
+  "world_size": 2,
+  "master_host": "HP-NOTEBOOK",
+  "master_port": 29500,
+  "local_batch_size": 64,
+  "nodes": {
+    "HP-NOTEBOOK": 0,
+    "PC-Fisso": 1
+  }
+}
