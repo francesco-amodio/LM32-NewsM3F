@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+
+cache
+outputs
+checkpoints
+
+.vscode
+.idea
+.DS_Store
+Thumbs.db
