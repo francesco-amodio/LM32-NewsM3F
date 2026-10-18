@@ -127,17 +127,10 @@ def run_candidate(candidate, candidate_index, args):
 def run_fan_in(args):
     """Esegue il Fan-in finale esclusivamente sul rank 0."""
 
+    # Solo il rank 0 esegue la selezione finale.
+    # Il rank 1 ha già contribuito ai training DDP dei candidati
+    # e non deve produrre una seconda copia del risultato.
     if args.rank != 0:
-        return
-
-    # select_best attualmente opera sulla directory
-    # outputs/distributed dei run finali.
-    if args.output_root != Path("outputs/distributed"):
-        print(
-            "\nFan-in automatico non eseguito: "
-            "output-root diverso da outputs/distributed.",
-            flush=True,
-        )
         return
 
     print(
@@ -145,11 +138,16 @@ def run_fan_in(args):
         flush=True,
     )
 
+    # Il Fan-in riceve lo stesso output-root usato dal Fan-out.
+    # In questo modo il workflow è riutilizzabile sia per i run
+    # definitivi sia per smoke test o altri esperimenti.
     subprocess.run(
         [
             sys.executable,
             "-m",
             "src.select_best",
+            "--input-root",
+            str(args.output_root),
         ],
         check=True,
     )

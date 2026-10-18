@@ -1,12 +1,9 @@
 """Fan-in dei risultati DDP e selezione del miglior modello candidato."""
 
+import argparse
 import json
 from pathlib import Path
 
-
-OUTPUT_DIR = Path("outputs")
-DISTRIBUTED_DIR = OUTPUT_DIR / "distributed"
-SELECTION_DIR = DISTRIBUTED_DIR / "selection"
 
 CANDIDATES = ("A", "B", "C")
 
@@ -15,11 +12,34 @@ CANDIDATES = ("A", "B", "C")
 SELECTION_METRIC = "best_micro_f1"
 
 
-def load_candidate_metadata(candidate):
+def parse_args():
+    """Legge i parametri del Fan-in dalla riga di comando."""
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Confronta i candidati A/B/C prodotti dal training DDP "
+            "e seleziona quello con la Micro-F1 migliore."
+        )
+    )
+
+    parser.add_argument(
+        "--input-root",
+        type=Path,
+        default=Path("outputs/distributed"),
+        help=(
+            "Directory che contiene candidate_A, candidate_B e candidate_C. "
+            "Default: outputs/distributed"
+        ),
+    )
+
+    return parser.parse_args()
+
+
+def load_candidate_metadata(candidate, input_root):
     """Carica e controlla i metadata DDP prodotti da un candidato."""
 
     metadata_path = (
-        DISTRIBUTED_DIR
+        input_root
         / f"candidate_{candidate}"
         / "metadata"
         / f"candidate_{candidate}.json"
@@ -55,8 +75,8 @@ def load_candidate_metadata(candidate):
                 f"del candidato {candidate}."
             )
 
-    # Evitiamo di mescolare accidentalmente risultati single-process
-    # con quelli prodotti dal training distribuito finale.
+    # Impediamo di mescolare accidentalmente risultati
+    # provenienti da modalità di training differenti.
     if metadata["execution_mode"] != "ddp":
         raise ValueError(
             f"Il candidato {candidate} non proviene da un training DDP: "
@@ -88,14 +108,24 @@ def get_best_epoch_result(metadata):
 
 
 def main():
+    args = parse_args()
+
+    input_root = args.input_root
+    selection_dir = input_root / "selection"
+
     candidate_results = []
 
+    print(
+        f"\nRoot risultati DDP: {input_root}"
+    )
+
     # FAN-IN:
-    # raccogliamo i risultati finali dei tre rami A, B e C,
-    # ciascuno addestrato mediante DDP sui due nodi fisici.
+    # raccogliamo in un unico punto i risultati dei tre rami
+    # indipendenti prodotti dal Fan-out.
     for candidate in CANDIDATES:
         metadata_path, metadata = load_candidate_metadata(
-            candidate
+            candidate,
+            input_root,
         )
 
         best_epoch_result = get_best_epoch_result(
@@ -117,14 +147,14 @@ def main():
         )
 
     # FAN-IN:
-    # i tre rami convergono qui e viene scelto esclusivamente
-    # il candidato con la Micro-F1 più alta sul validation set.
+    # i tre rami convergono qui e viene selezionato
+    # il candidato con la Micro-F1 maggiore sul validation set.
     best_result = max(
         candidate_results,
         key=lambda result: result["micro_f1"],
     )
 
-    SELECTION_DIR.mkdir(
+    selection_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
@@ -132,6 +162,7 @@ def main():
     selection = {
         "execution_mode": "ddp",
         "selection_metric": SELECTION_METRIC,
+        "input_root": str(input_root),
         "selected_candidate": best_result["candidate"],
         "selected_score": best_result["micro_f1"],
         "selected_epoch": best_result["best_epoch"],
@@ -140,7 +171,7 @@ def main():
     }
 
     selection_path = (
-        SELECTION_DIR / "best_model.json"
+        selection_dir / "best_model.json"
     )
 
     with selection_path.open(
