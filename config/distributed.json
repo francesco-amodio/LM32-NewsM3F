@@ -1,11 +1,21 @@
 {
   "backend": "gloo",
   "world_size": 2,
-  "master_host": "HP-NOTEBOOK",
-  "master_port": 29500,
+  "master_addr": "192.168.100.13",
+  "base_port": 29500,
   "local_batch_size": 64,
+  "gradient_accumulation_steps": 1,
+  "epochs": 8,
+  "docker_image": "lm32-newsm3f:dev",
+  "output_root": "outputs/distributed",
   "nodes": {
-    "HP-NOTEBOOK": 0,
-    "PC-Fisso": 1
+    "HP-NOTEBOOK": {
+      "rank": 0,
+      "interface": "eth0"
+    },
+    "PC-Fisso": {
+      "rank": 1,
+      "interface": "eth0"
+    }
   }
 }

@@ -1,10 +1,11 @@
-"""Avvio configurabile di un nodo del training distribuito DDP."""
+"""Launcher host-side del workflow DDP containerizzato News-M3F."""
 
 import argparse
 import json
+import shlex
+import shutil
 import socket
 import subprocess
-import sys
 from pathlib import Path
 
 
@@ -12,47 +13,55 @@ DEFAULT_CONFIG_PATH = Path("config/distributed.json")
 
 
 def parse_args():
-    """Legge i parametri dell'esperimento da inoltrare al training DDP."""
+    """Legge la configurazione e gli eventuali override runtime."""
 
     parser = argparse.ArgumentParser(
-        description="Avvia il worker DDP configurato per questo nodo."
+        description=(
+            "Avvia nel container Docker il workflow distribuito "
+            "News-M3F sul nodo corrente."
+        )
     )
 
     parser.add_argument(
         "--config",
         type=Path,
         default=DEFAULT_CONFIG_PATH,
-        help="File JSON con la configurazione del cluster.",
+        help="Configurazione del cluster distribuito.",
     )
 
     parser.add_argument(
-        "--candidate",
-        choices=["A", "B", "C"],
-        default="A",
+        "--master-addr",
+        default=None,
+        help=(
+            "Override dell'indirizzo del rank 0. "
+            "Se omesso viene usato il valore del file JSON."
+        ),
     )
 
     parser.add_argument(
         "--epochs",
         type=int,
-        default=1,
+        default=None,
+        help="Override del numero massimo di epoche.",
     )
 
     parser.add_argument(
-        "--output-dir",
-        default="outputs/ddp_multinode",
+        "--output-root",
+        default=None,
+        help="Override della directory degli output nel container.",
     )
 
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Mostra il comando risolto senza avviare il training.",
+        help="Mostra il comando Docker senza eseguirlo.",
     )
 
     return parser.parse_args()
 
 
 def load_config(config_path):
-    """Carica e valida i campi essenziali della configurazione distribuita."""
+    """Carica e valida la configurazione essenziale del cluster."""
 
     if not config_path.exists():
         raise FileNotFoundError(
@@ -68,9 +77,13 @@ def load_config(config_path):
     required_fields = (
         "backend",
         "world_size",
-        "master_host",
-        "master_port",
+        "master_addr",
+        "base_port",
         "local_batch_size",
+        "gradient_accumulation_steps",
+        "epochs",
+        "docker_image",
+        "output_root",
         "nodes",
     )
 
@@ -83,24 +96,44 @@ def load_config(config_path):
     return config
 
 
-def resolve_rank(hostname, nodes):
-    """Determina il rank associato al nome del computer."""
+def resolve_node(hostname, nodes):
+    """Determina rank e interfaccia di rete del nodo corrente."""
 
-    # Confronto case-insensitive, utile soprattutto su Windows.
     normalized_nodes = {
-        node_name.lower(): rank
-        for node_name, rank in nodes.items()
+        node_name.lower(): node_config
+        for node_name, node_config in nodes.items()
     }
 
     normalized_hostname = hostname.lower()
 
-    if normalized_hostname not in normalized_nodes:
-        raise ValueError(
-            f"Il nodo '{hostname}' non è presente nella configurazione. "
-            f"Nodi configurati: {', '.join(nodes.keys())}"
-        )
+    # Gestiamo anche l'eventualità che Linux restituisca
+    # un hostname qualificato, ad esempio HP-NOTEBOOK.station.
+    possible_names = (
+        normalized_hostname,
+        normalized_hostname.split(".")[0],
+    )
 
-    return normalized_nodes[normalized_hostname]
+    for name in possible_names:
+        if name in normalized_nodes:
+            node_config = normalized_nodes[name]
+
+            if "rank" not in node_config:
+                raise ValueError(
+                    f"Rank mancante nella configurazione del nodo {hostname}."
+                )
+
+            if "interface" not in node_config:
+                raise ValueError(
+                    f"Interfaccia mancante nella configurazione "
+                    f"del nodo {hostname}."
+                )
+
+            return node_config
+
+    raise ValueError(
+        f"Il nodo '{hostname}' non è presente nella configurazione. "
+        f"Nodi configurati: {', '.join(nodes.keys())}"
+    )
 
 
 def main():
@@ -110,65 +143,133 @@ def main():
         args.config
     )
 
+    # Questo launcher deve essere eseguito sull'host WSL,
+    # dove è disponibile il Docker Engine usato dal progetto.
+    if shutil.which("docker") is None:
+        raise RuntimeError(
+            "Docker non trovato. "
+            "Eseguire il launcher dentro Ubuntu/WSL."
+        )
+
     hostname = socket.gethostname()
 
-    rank = resolve_rank(
+    node_config = resolve_node(
         hostname,
         config["nodes"],
     )
 
+    rank = node_config["rank"]
+    network_interface = node_config["interface"]
+
+    # Gli override permettono di cambiare parametri di deployment
+    # senza modificare né il codice né necessariamente il JSON.
+    master_addr = (
+        args.master_addr
+        if args.master_addr is not None
+        else config["master_addr"]
+    )
+
+    epochs = (
+        args.epochs
+        if args.epochs is not None
+        else config["epochs"]
+    )
+
+    output_root = (
+        args.output_root
+        if args.output_root is not None
+        else config["output_root"]
+    )
+
+    # Ricaviamo automaticamente la radice del repository.
+    # In questo modo non codifichiamo username o percorsi assoluti.
+    repo_root = Path(__file__).resolve().parents[1]
+
+    cache_dir = repo_root / "cache"
+    outputs_dir = repo_root / "outputs"
+
+    if not cache_dir.exists():
+        raise FileNotFoundError(
+            f"Cache non trovata: {cache_dir}"
+        )
+
+    outputs_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    container_name = (
+        f"lm32-workflow-rank{rank}"
+    )
+
     command = [
-        sys.executable,
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        "host",
+        "--name",
+        container_name,
+        "-e",
+        f"GLOO_SOCKET_IFNAME={network_interface}",
+        "-v",
+        f"{cache_dir}:/app/cache:ro",
+        "-v",
+        f"{outputs_dir}:/app/outputs",
+        config["docker_image"],
+        "python",
         "-m",
-        "src.train_ddp",
-        "--candidate",
-        args.candidate,
-        "--epochs",
-        str(args.epochs),
-        "--world-size",
-        str(config["world_size"]),
-        "--local-batch-size",
-        str(config["local_batch_size"]),
+        "src.run_fanout",
         "--rank",
         str(rank),
+        "--world-size",
+        str(config["world_size"]),
         "--master-addr",
-        config["master_host"],
-        "--master-port",
-        str(config["master_port"]),
-        "--output-dir",
-        args.output_dir,
+        master_addr,
+        "--base-port",
+        str(config["base_port"]),
+        "--epochs",
+        str(epochs),
+        "--local-batch-size",
+        str(config["local_batch_size"]),
+        "--grad-accum-steps",
+        str(config["gradient_accumulation_steps"]),
+        "--output-root",
+        output_root,
     ]
 
-    print("\n=== CONFIGURAZIONE NODO ===")
-    print(f"Hostname:       {hostname}")
-    print(f"Rank:           {rank}")
-    print(f"World size:     {config['world_size']}")
-    print(f"Master:         {config['master_host']}")
-    print(f"Master port:    {config['master_port']}")
-    print(f"Backend:        {config['backend']}")
+    print("\n=== LAUNCHER WORKFLOW DISTRIBUITO ===")
+    print(f"Hostname:          {hostname}")
+    print(f"Rank:              {rank}")
+    print(f"World size:        {config['world_size']}")
+    print(f"Master address:    {master_addr}")
+    print(f"Interfaccia Gloo:  {network_interface}")
+    print(f"Porta base:        {config['base_port']}")
+    print(f"Epoche:            {epochs}")
+    print(f"Batch locale:      {config['local_batch_size']}")
     print(
-        f"Batch locale:   "
-        f"{config['local_batch_size']}"
+        "Accumulo gradienti: "
+        f"{config['gradient_accumulation_steps']}"
     )
+    print(f"Immagine Docker:   {config['docker_image']}")
+    print(f"Output root:       {output_root}")
+    print(f"Repository:        {repo_root}")
 
-    print("\nComando DDP:")
-    print(" ".join(command))
+    print("\nComando Docker:")
+    print(
+        shlex.join(command)
+    )
 
     if args.dry_run:
-        print("\nDry run: training non avviato.")
+        print(
+            "\nDry run: container non avviato."
+        )
         return
 
-    # Avvia train_ddp come processo figlio e restituisce
-    # lo stesso codice di uscita in caso di errore.
-    completed_process = subprocess.run(
+    subprocess.run(
         command,
-        check=False,
+        check=True,
     )
-
-    if completed_process.returncode != 0:
-        raise SystemExit(
-            completed_process.returncode
-        )
 
 
 if __name__ == "__main__":
