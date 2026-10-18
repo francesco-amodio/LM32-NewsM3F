@@ -1,12 +1,12 @@
-"""Fan-in dei risultati e selezione del miglior modello candidato."""
+"""Fan-in dei risultati DDP e selezione del miglior modello candidato."""
 
 import json
 from pathlib import Path
 
 
 OUTPUT_DIR = Path("outputs")
-METADATA_DIR = OUTPUT_DIR / "metadata"
-SELECTION_DIR = OUTPUT_DIR / "selection"
+DISTRIBUTED_DIR = OUTPUT_DIR / "distributed"
+SELECTION_DIR = DISTRIBUTED_DIR / "selection"
 
 CANDIDATES = ("A", "B", "C")
 
@@ -16,16 +16,18 @@ SELECTION_METRIC = "best_micro_f1"
 
 
 def load_candidate_metadata(candidate):
-    """Carica e controlla i metadata prodotti dal training di un candidato."""
+    """Carica e controlla i metadata DDP prodotti da un candidato."""
 
     metadata_path = (
-        METADATA_DIR
+        DISTRIBUTED_DIR
+        / f"candidate_{candidate}"
+        / "metadata"
         / f"candidate_{candidate}.json"
     )
 
     if not metadata_path.exists():
         raise FileNotFoundError(
-            f"Metadata non trovati per il candidato {candidate}: "
+            f"Metadata DDP non trovati per il candidato {candidate}: "
             f"{metadata_path}"
         )
 
@@ -35,10 +37,11 @@ def load_candidate_metadata(candidate):
     ) as file:
         metadata = json.load(file)
 
-    # Controlliamo subito i campi necessari al fan-in,
-    # così eventuali output incompleti vengono rilevati chiaramente.
+    # Questi campi sono necessari per eseguire il Fan-in
+    # e ricostruire le metriche dell'epoca migliore.
     required_fields = (
         "candidate",
+        "execution_mode",
         "best_micro_f1",
         "best_epoch",
         "best_checkpoint",
@@ -51,6 +54,20 @@ def load_candidate_metadata(candidate):
                 f"Campo '{field}' mancante nei metadata "
                 f"del candidato {candidate}."
             )
+
+    # Evitiamo di mescolare accidentalmente risultati single-process
+    # con quelli prodotti dal training distribuito finale.
+    if metadata["execution_mode"] != "ddp":
+        raise ValueError(
+            f"Il candidato {candidate} non proviene da un training DDP: "
+            f"execution_mode={metadata['execution_mode']}"
+        )
+
+    if metadata["candidate"] != candidate:
+        raise ValueError(
+            f"Il file {metadata_path} dichiara il candidato "
+            f"{metadata['candidate']} invece di {candidate}."
+        )
 
     return metadata_path, metadata
 
@@ -73,8 +90,9 @@ def get_best_epoch_result(metadata):
 def main():
     candidate_results = []
 
-    # FAN-IN: raccogliamo in un unico punto i risultati
-    # prodotti indipendentemente dai candidati A, B e C.
+    # FAN-IN:
+    # raccogliamo i risultati finali dei tre rami A, B e C,
+    # ciascuno addestrato mediante DDP sui due nodi fisici.
     for candidate in CANDIDATES:
         metadata_path, metadata = load_candidate_metadata(
             candidate
@@ -87,6 +105,7 @@ def main():
         candidate_results.append(
             {
                 "candidate": candidate,
+                "execution_mode": metadata["execution_mode"],
                 "metadata_path": str(metadata_path),
                 "best_checkpoint": metadata["best_checkpoint"],
                 "best_epoch": metadata["best_epoch"],
@@ -97,8 +116,9 @@ def main():
             }
         )
 
-    # Il criterio di selezione è esclusivamente la migliore
-    # Micro-F1 ottenuta sul validation set.
+    # FAN-IN:
+    # i tre rami convergono qui e viene scelto esclusivamente
+    # il candidato con la Micro-F1 più alta sul validation set.
     best_result = max(
         candidate_results,
         key=lambda result: result["micro_f1"],
@@ -110,6 +130,7 @@ def main():
     )
 
     selection = {
+        "execution_mode": "ddp",
         "selection_metric": SELECTION_METRIC,
         "selected_candidate": best_result["candidate"],
         "selected_score": best_result["micro_f1"],
@@ -133,7 +154,7 @@ def main():
             indent=2,
         )
 
-    print("\n=== FAN-IN: CONFRONTO CANDIDATI ===")
+    print("\n=== FAN-IN DDP: CONFRONTO CANDIDATI ===")
 
     for result in candidate_results:
         print(
@@ -144,7 +165,7 @@ def main():
             f"Recall: {result['recall']:.4f}"
         )
 
-    print("\n=== MODELLO SELEZIONATO ===")
+    print("\n=== MODELLO DDP SELEZIONATO ===")
     print(
         f"Candidato:  {best_result['candidate']}"
     )
