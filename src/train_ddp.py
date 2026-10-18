@@ -4,6 +4,7 @@ import argparse
 import json
 import platform
 import time
+from contextlib import nullcontext
 from itertools import islice
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from src.train import (
 
 DEFAULT_WORLD_SIZE = 2
 DEFAULT_LOCAL_BATCH_SIZE = 64
+DEFAULT_GRAD_ACCUM_STEPS = 1
 DEFAULT_MAX_EPOCHS = 8
 
 DEFAULT_MASTER_ADDR = "127.0.0.1"
@@ -65,6 +67,16 @@ def parse_args():
         type=int,
         default=DEFAULT_LOCAL_BATCH_SIZE,
         help="Batch elaborato da ciascun worker.",
+    )
+
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=DEFAULT_GRAD_ACCUM_STEPS,
+        help=(
+            "Numero di micro-batch da accumulare prima della "
+            "sincronizzazione DDP e dell'aggiornamento dei pesi."
+        ),
     )
 
     parser.add_argument(
@@ -102,7 +114,12 @@ def parse_args():
         default=DEFAULT_OUTPUT_DIR,
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.grad_accum_steps < 1:
+        parser.error("--grad-accum-steps deve essere almeno 1.")
+
+    return args
 
 
 def setup_distributed(rank, world_size, master_addr, master_port):
@@ -138,48 +155,108 @@ def train_one_epoch_ddp(
     loss_function,
     epoch_number,
     rank,
+    grad_accum_steps,
 ):
-    """Esegue un'epoca e calcola la loss globale dei worker."""
+    """Esegue un'epoca DDP con accumulo e loss globale dei worker."""
 
     model.train()
 
     local_loss_sum = 0.0
     local_examples = 0
+    total_batches = len(loader)
+
+    # I gradienti vengono azzerati all'inizio di ogni gruppo di
+    # micro-batch. I micro-batch intermedi accumulano i gradienti
+    # localmente senza eseguire All-Reduce.
+    optimizer.zero_grad(set_to_none=True)
 
     for batch_index, batch in enumerate(loader, start=1):
-        optimizer.zero_grad()
-
-        logits = model(
-            batch["input_ids"],
-            batch["attention_mask"],
+        group_start = (
+            ((batch_index - 1) // grad_accum_steps)
+            * grad_accum_steps
+            + 1
+        )
+        group_end = min(
+            group_start + grad_accum_steps - 1,
+            total_batches,
         )
 
-        loss = loss_function(
-            logits,
-            batch["labels"],
+        # L'ultimo gruppo può contenere meno micro-batch del previsto.
+        # Calcoliamo quanti esempi contiene realmente, così la loss
+        # accumulata resta correttamente pesata anche nel gruppo finale.
+        group_size = group_end - group_start + 1
+        nominal_batch_size = loader.batch_size
+        last_batch_size = (
+            len(loader.sampler)
+            - (total_batches - 1) * nominal_batch_size
         )
 
-        # DDP intercetta backward() e sincronizza i gradienti
-        # dei worker mediante collective communication / All-Reduce.
-        loss.backward()
-
-        optimizer.step()
+        if group_end == total_batches:
+            group_examples = (
+                (group_size - 1) * nominal_batch_size
+                + last_batch_size
+            )
+        else:
+            group_examples = group_size * nominal_batch_size
 
         batch_size = batch["labels"].shape[0]
+        should_sync = batch_index == group_end
 
+        # DDP normalmente sincronizza i gradienti a ogni backward().
+        # no_sync() evita la Collective Communication sui micro-batch
+        # intermedi; l'ultimo backward del gruppo esegue l'All-Reduce.
+        sync_context = (
+            nullcontext()
+            if should_sync
+            else model.no_sync()
+        )
+
+        with sync_context:
+            logits = model(
+                batch["input_ids"],
+                batch["attention_mask"],
+            )
+
+            loss = loss_function(
+                logits,
+                batch["labels"],
+            )
+
+            # La loss di ciascun micro-batch viene pesata in base al
+            # numero di esempi che contiene. In questo modo i gradienti
+            # accumulati equivalgono alla media dell'intero gruppo.
+            scaled_loss = (
+                loss
+                * batch_size
+                / group_examples
+            )
+            scaled_loss.backward()
+
+        # L'optimizer aggiorna i pesi soltanto dopo avere accumulato
+        # tutti i micro-batch del gruppo e sincronizzato i gradienti.
+        if should_sync:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        # Per le statistiche conserviamo la loss originale, non quella
+        # scalata per il gradient accumulation.
         local_loss_sum += loss.item() * batch_size
         local_examples += batch_size
 
-        if rank == 0 and batch_index % 100 == 0:
+        if rank == 0 and (
+            batch_index % 100 == 0
+            or batch_index == total_batches
+        ):
             print(
                 f"Epoca {epoch_number} | "
-                f"Batch locale {batch_index}/{len(loader)}",
+                f"Micro-batch locale "
+                f"{batch_index}/{total_batches}",
                 flush=True,
             )
 
     # Ogni worker possiede soltanto la loss del proprio shard.
-    # Con un ulteriore All-Reduce sommiamo le statistiche locali
-    # per ottenere la loss media dell'intero training distribuito.
+    # Un ulteriore All-Reduce somma le statistiche locali per
+    # ottenere la loss media dell'intero training distribuito.
     statistics = torch.tensor(
         [local_loss_sum, local_examples],
         dtype=torch.float64,
@@ -381,6 +458,12 @@ def run_worker(rank, args):
                 args.local_batch_size
                 * args.world_size
             ),
+            "gradient_accumulation_steps": args.grad_accum_steps,
+            "effective_global_batch_size": (
+                args.local_batch_size
+                * args.world_size
+                * args.grad_accum_steps
+            ),
             "random_seed": RANDOM_SEED,
             "learning_rate": LEARNING_RATE,
             "weight_decay": WEIGHT_DECAY,
@@ -426,6 +509,14 @@ def run_worker(rank, args):
             f"{args.local_batch_size * args.world_size}"
         )
         print(
+            f"Accumulo gradienti: "
+            f"{args.grad_accum_steps}"
+        )
+        print(
+            f"Batch globale eff.: "
+            f"{args.local_batch_size * args.world_size * args.grad_accum_steps}"
+        )
+        print(
             f"Esempi per worker:  "
             f"{len(train_sampler):,}"
         )
@@ -461,6 +552,7 @@ def run_worker(rank, args):
             loss_function,
             epoch,
             rank,
+            args.grad_accum_steps,
         )
 
         stop_training = False
