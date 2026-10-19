@@ -238,6 +238,52 @@ def build_fan_in_command(
         output_root,
     ]
 
+def build_test_command(
+    repo_root,
+    config,
+    output_root,
+):
+    """Costruisce il container dedicato alla valutazione finale sul test set."""
+
+    cache_dir = repo_root / "cache"
+    outputs_dir = repo_root / "outputs"
+
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "lm32-final-test",
+
+        # Manteniamo la stessa configurazione CPU stabile
+        # utilizzata durante il training sui nodi Ivy Bridge.
+        "-e",
+        "ATEN_CPU_CAPABILITY=default",
+        "-e",
+        "ONEDNN_MAX_CPU_ISA=AVX",
+        "-e",
+        "DNNL_MAX_CPU_ISA=AVX",
+        "-e",
+        "OMP_NUM_THREADS=1",
+        "-e",
+        "MKL_NUM_THREADS=1",
+        "-e",
+        "OPENBLAS_NUM_THREADS=1",
+
+        # Il test deve leggere sia il dataset preprocessato
+        # sia il checkpoint selezionato dal Fan-in.
+        "-v",
+        f"{cache_dir}:/app/cache:ro",
+        "-v",
+        f"{outputs_dir}:/app/outputs",
+
+        config["docker_image"],
+        "python",
+        "-m",
+        "src.evaluate_test",
+        "--input-root",
+        output_root,
+    ]
 
 def main():
     args = parse_args()
@@ -352,6 +398,7 @@ def main():
 
     # Il Fan-in non richiede DDP e viene eseguito una sola volta,
     # sul nodo rank 0, dopo il completamento dei tre rami.
+    
     if rank == 0:
         fan_in_command = build_fan_in_command(
             repo_root=repo_root,
@@ -370,6 +417,29 @@ def main():
         if not args.dry_run:
             subprocess.run(
                 fan_in_command,
+                check=True,
+            )
+
+        # Il test set viene utilizzato soltanto dopo che il Fan-in
+        # ha selezionato il modello migliore sulla validation.
+        # Anche questa fase viene eseguita una sola volta sul rank 0.
+        test_command = build_test_command(
+            repo_root=repo_root,
+            config=config,
+            output_root=output_root,
+        )
+
+        print(
+            "\n=== FAN-IN COMPLETATO: AVVIO TEST FINALE ==="
+        )
+
+        print(
+            shlex.join(test_command)
+        )
+
+        if not args.dry_run:
+            subprocess.run(
+                test_command,
                 check=True,
             )
 
