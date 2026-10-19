@@ -11,6 +11,13 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+# Le CPU Ivy Bridge usate dai due nodi hanno mostrato SIGILL
+# in alcuni percorsi multithread di libtorch_cpu.so.
+# Limitiamo quindi PyTorch a un solo thread CPU per processo.
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, DistributedSampler
