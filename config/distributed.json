@@ -6,7 +6,7 @@
   "local_batch_size": 64,
   "gradient_accumulation_steps": 1,
   "epochs": 8,
-  "docker_image": "lm32-newsm3f:dev",
+  "docker_image": "lm32-newsm3f:compat",
   "output_root": "outputs/distributed",
   "nodes": {
     "HP-NOTEBOOK": {
