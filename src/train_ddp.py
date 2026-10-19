@@ -426,7 +426,6 @@ def run_worker(rank, args):
     model = DDP(
         model,
         broadcast_buffers=False,
-        find_unused_parameters=True,
     )
 
     loss_function, pos_weight = build_loss_function(
