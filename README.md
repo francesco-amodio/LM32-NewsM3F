@@ -10,13 +10,13 @@ L'esecuzione distribuita utilizza due nodi CPU, PyTorch Distributed Data Paralle
 
 1 - Requisiti
 
-Python 3.11
+– Python 3.11
 
-Docker
+– Docker
 
-due nodi collegati in rete
+– due nodi collegati in rete
 
-ambiente Linux/WSL per l'esecuzione distribuita
+– ambiente Linux/WSL per l'esecuzione distribuita
 
 Le dipendenze Python sono definite in "requirements.txt".
 
@@ -34,17 +34,17 @@ Il preprocessing viene eseguito una sola volta:
 
 Lo script:
 
-scarica il dataset "News-M3F/News-M3F";
+– scarica il dataset "News-M3F/News-M3F";
 
-crea gli split di training, validation e test;
+– crea gli split di training, validation e test;
 
-seleziona le classi Level2 con almeno 500 occorrenze;
+– seleziona le classi Level2 con almeno 500 occorrenze;
 
-costruisce il vocabolario sul solo training;
+– costruisce il vocabolario sul solo training;
 
-tokenizza e codifica testi e label;
+– tokenizza e codifica testi e label;
 
-salva gli artefatti preprocessati in "cache/preprocessed/".
+– salva gli artefatti preprocessati in "cache/preprocessed/".
 
 La directory "cache/preprocessed" deve essere copiata anche sul secondo nodo mantenendo lo stesso percorso relativo al repository.
 
@@ -56,27 +56,27 @@ La configurazione distribuita è contenuta in "config/distributed.json".
 
 Prima dell'esecuzione verificare in particolare:
 
-"master\_addr": indirizzo IP del nodo rank 0;
+– "master\_addr": indirizzo IP del nodo rank 0;
 
-"world\_size": numero di nodi;
+– "world\_size": numero di nodi;
 
-hostname e rank dei nodi;
+– hostname e rank dei nodi;
 
-interfaccia di rete utilizzata da Gloo;
+– interfaccia di rete utilizzata da Gloo;
 
-batch size locale;
+– batch size locale;
 
-numero di epoche.
+– numero di epoche.
 
 Nella configurazione utilizzata per il progetto:
 
-HP-NOTEBOOK = rank 0
+– HP-NOTEBOOK = rank 0
 
-PC-Fisso = rank 1
+– PC-Fisso = rank 1
 
-world size = 2
+– world size = 2
 
-backend = Gloo
+– backend = Gloo
 
 
 
@@ -126,11 +126,11 @@ Per modificare il numero di epoche senza cambiare la configurazione:
 
 Il launcher esegue in sequenza tre candidati:
 
-A: Binary Cross-Entropy (BCE) non pesata;
+– A: Binary Cross-Entropy (BCE) non pesata;
 
-B: Binary Cross-Entropy (BCE) con "pos\_weight";
+– B: Binary Cross-Entropy (BCE) con "pos\_weight";
 
-C: Binary Cross-Entropy (BCE) con pesatura attenuata tramite radice quadrata.
+– C: Binary Cross-Entropy (BCE) con pesatura attenuata tramite radice quadrata.
 
 Ogni candidato viene addestrato mediante DDP sui due nodi.
 
