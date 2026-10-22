@@ -2,20 +2,23 @@
 
 import argparse
 import json
+import re
 import shlex
 import shutil
 import socket
 import subprocess
+import time
+from datetime import datetime
 from pathlib import Path
 
 
 DEFAULT_CONFIG_PATH = Path("config/distributed.json")
 CANDIDATES = ("A", "B", "C")
+RUN_SYNC_TIMEOUT_SECONDS = 120
 
 
 def parse_args():
     """Legge la configurazione e gli eventuali override runtime."""
-
     parser = argparse.ArgumentParser(
         description=(
             "Avvia il workflow distribuito News-M3F. "
@@ -29,7 +32,6 @@ def parse_args():
         default=DEFAULT_CONFIG_PATH,
         help="Configurazione del cluster distribuito.",
     )
-
     parser.add_argument(
         "--master-addr",
         default=None,
@@ -47,11 +49,13 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--output-root",
+        "--run-description",
         default=None,
-        help="Override della directory radice degli output.",
+        help=(
+            "Descrizione opzionale del run. Il rank 0 la aggiunge "
+            "al timestamp usato come nome della directory di output."
+        ),
     )
-
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -68,7 +72,6 @@ def load_config(config_path):
         raise FileNotFoundError(
             f"Configurazione non trovata: {config_path}"
         )
-
     with config_path.open(
         "r",
         encoding="utf-8",
@@ -84,10 +87,8 @@ def load_config(config_path):
         "gradient_accumulation_steps",
         "epochs",
         "docker_image",
-        "output_root",
         "nodes",
     )
-
     for field in required_fields:
         if field not in config:
             raise ValueError(
@@ -106,7 +107,6 @@ def resolve_node(hostname, nodes):
     }
 
     normalized_hostname = hostname.lower()
-
     possible_names = (
         normalized_hostname,
         normalized_hostname.split(".")[0],
@@ -120,7 +120,6 @@ def resolve_node(hostname, nodes):
                 raise ValueError(
                     f"Rank mancante per il nodo {hostname}."
                 )
-
             if "interface" not in node_config:
                 raise ValueError(
                     f"Interfaccia mancante per il nodo {hostname}."
@@ -134,6 +133,196 @@ def resolve_node(hostname, nodes):
     )
 
 
+def sanitize_run_description(description):
+    """Rende sicura la descrizione per il nome di una directory."""
+
+    if description is None:
+        return None
+
+    description = re.sub(r"\s+", " ", description).strip()
+
+    if not description:
+        return None
+
+    # Evita caratteri non validi nei nomi di directory Windows.
+    description = re.sub(
+        r'[<>:"/\\|?*\x00-\x1f]',
+        "_",
+        description,
+    )
+    description = description.rstrip(" .")
+
+    return description or None
+
+
+def build_run_name(run_description):
+    """Genera il nome del run usando esclusivamente l'orologio del rank 0."""
+
+    timestamp = datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
+    run_description = sanitize_run_description(run_description)
+
+    if run_description:
+        return (
+            f"{timestamp} - {run_description}",
+            run_description,
+        )
+
+    return timestamp, None
+
+
+def publish_run_identity(
+    run_name,
+    run_description,
+    sync_port,
+    world_size,
+):
+    """Invia agli altri rank il nome del run deciso dal rank 0."""
+
+    payload = (
+        json.dumps(
+            {
+                "run_name": run_name,
+                "run_description": run_description,
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    with socket.socket(
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+    ) as server:
+        server.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_REUSEADDR,
+            1,
+        )
+        server.bind(("", sync_port))
+        server.listen(max(1, world_size - 1))
+
+        print(
+            "Rank 0 in attesa dei peer sulla porta "
+            f"{sync_port} per condividere il nome del run...",
+            flush=True,
+        )
+
+        for _ in range(world_size - 1):
+            connection, _ = server.accept()
+
+            with connection:
+                connection.sendall(payload)
+
+
+def receive_run_identity(
+    master_addr,
+    sync_port,
+    timeout_seconds=RUN_SYNC_TIMEOUT_SECONDS,
+):
+    """Riceve dal rank 0 il nome condiviso del run."""
+
+    deadline = time.monotonic() + timeout_seconds
+    last_error = None
+
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(
+                (master_addr, sync_port),
+                timeout=5,
+            ) as client:
+                with client.makefile(
+                    "r",
+                    encoding="utf-8",
+                ) as stream:
+                    line = stream.readline()
+
+                if not line:
+                    raise RuntimeError(
+                        "Il rank 0 ha chiuso la connessione senza "
+                        "inviare il nome del run."
+                    )
+
+                return json.loads(line)
+
+        except (
+            ConnectionRefusedError,
+            OSError,
+            json.JSONDecodeError,
+        ) as error:
+            last_error = error
+            time.sleep(1)
+
+    raise TimeoutError(
+        "Impossibile ricevere dal rank 0 il nome del run su "
+        f"{master_addr}:{sync_port}."
+    ) from last_error
+
+
+def resolve_run_identity(
+    rank,
+    world_size,
+    master_addr,
+    base_port,
+    requested_description,
+    synchronize=True,
+):
+    """Fa generare il nome al rank 0 e lo distribuisce agli altri rank."""
+
+    requested_description = sanitize_run_description(
+        requested_description
+    )
+
+    # In dry-run non viene eseguito alcun workflow reale: evitiamo quindi
+    # di obbligare alla presenza simultanea di entrambi i nodi.
+    if not synchronize:
+        return build_run_name(requested_description)
+
+    # Le porte base, base+1 e base+2 sono usate dai candidati A, B e C.
+    # base-1 viene riservata al breve handshake iniziale del launcher.
+    sync_port = base_port - 1
+
+    if sync_port <= 0:
+        raise ValueError(
+            "base_port deve essere maggiore di 1."
+        )
+
+    if rank == 0:
+        run_name, run_description = build_run_name(
+            requested_description
+        )
+
+        if world_size > 1:
+            publish_run_identity(
+                run_name=run_name,
+                run_description=run_description,
+                sync_port=sync_port,
+                world_size=world_size,
+            )
+
+        return run_name, run_description
+
+    payload = receive_run_identity(
+        master_addr=master_addr,
+        sync_port=sync_port,
+    )
+
+    run_name = payload["run_name"]
+    run_description = payload.get("run_description")
+
+    # Il rank 0 è la fonte autorevole del nome. Se anche sul rank 1
+    # è stata specificata una descrizione, verifichiamo che coincida.
+    if (
+        requested_description is not None
+        and requested_description != run_description
+    ):
+        raise ValueError(
+            "La descrizione del run specificata su questo nodo "
+            "non coincide con quella determinata dal rank 0."
+        )
+
+    return run_name, run_description
+
+
 def build_training_command(
     candidate,
     candidate_index,
@@ -143,7 +332,7 @@ def build_training_command(
     config,
     master_addr,
     epochs,
-    output_root,
+    run_output_root,
 ):
     """Costruisce il docker run di un singolo ramo del Fan-out."""
 
@@ -155,13 +344,11 @@ def build_training_command(
     )
 
     candidate_output = (
-        f"{output_root}/candidate_{candidate}"
+        f"{run_output_root}/candidate_{candidate}"
     )
-
     container_name = (
         f"lm32-candidate-{candidate.lower()}-rank{rank}"
     )
-
     return [
         "docker",
         "run",
@@ -216,7 +403,7 @@ def build_training_command(
 def build_fan_in_command(
     repo_root,
     config,
-    output_root,
+    run_output_root,
 ):
     """Costruisce il container dedicato al Fan-in finale."""
 
@@ -235,13 +422,14 @@ def build_fan_in_command(
         "-m",
         "src.select_best",
         "--input-root",
-        output_root,
+        run_output_root,
     ]
+
 
 def build_test_command(
     repo_root,
     config,
-    output_root,
+    run_output_root,
 ):
     """Costruisce il container dedicato alla valutazione finale sul test set."""
 
@@ -254,7 +442,6 @@ def build_test_command(
         "--rm",
         "--name",
         "lm32-final-test",
-
         # Manteniamo la stessa configurazione CPU stabile
         # utilizzata durante il training sui nodi Ivy Bridge.
         "-e",
@@ -269,21 +456,20 @@ def build_test_command(
         "MKL_NUM_THREADS=1",
         "-e",
         "OPENBLAS_NUM_THREADS=1",
-
         # Il test deve leggere sia il dataset preprocessato
         # sia il checkpoint selezionato dal Fan-in.
         "-v",
         f"{cache_dir}:/app/cache:ro",
         "-v",
         f"{outputs_dir}:/app/outputs",
-
         config["docker_image"],
         "python",
         "-m",
         "src.evaluate_test",
         "--input-root",
-        output_root,
+        run_output_root,
     ]
+
 
 def main():
     args = parse_args()
@@ -291,7 +477,6 @@ def main():
     config = load_config(
         args.config
     )
-
     if shutil.which("docker") is None:
         raise RuntimeError(
             "Docker non trovato. "
@@ -313,17 +498,10 @@ def main():
         if args.master_addr is not None
         else config["master_addr"]
     )
-
     epochs = (
         args.epochs
         if args.epochs is not None
         else config["epochs"]
-    )
-
-    output_root = (
-        args.output_root
-        if args.output_root is not None
-        else config["output_root"]
     )
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -335,8 +513,26 @@ def main():
         raise FileNotFoundError(
             f"Cache non trovata: {cache_dir}"
         )
-
     outputs_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    run_name, run_description = resolve_run_identity(
+        rank=rank,
+        world_size=config["world_size"],
+        master_addr=master_addr,
+        base_port=config["base_port"],
+        requested_description=args.run_description,
+        synchronize=not args.dry_run,
+    )
+
+    run_output_root = f"outputs/{run_name}"
+
+    # La directory viene creata su entrambi i nodi. Il nome è identico
+    # perché, nelle esecuzioni reali, viene determinato dal solo rank 0.
+    run_dir = outputs_dir / run_name
+    run_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
@@ -355,7 +551,12 @@ def main():
         f"{config['gradient_accumulation_steps']}"
     )
     print(f"Immagine Docker:    {config['docker_image']}")
-    print(f"Output root:        {output_root}")
+    print(f"Nome run:           {run_name}")
+    print(
+        "Descrizione run:    "
+        f"{run_description or '(nessuna)'}"
+    )
+    print(f"Directory output:   {run_output_root}")
     print(f"Repository:         {repo_root}")
 
     # FAN-OUT logico:
@@ -367,7 +568,6 @@ def main():
         master_port = (
             config["base_port"] + candidate_index
         )
-
         command = build_training_command(
             candidate=candidate,
             candidate_index=candidate_index,
@@ -377,9 +577,8 @@ def main():
             config=config,
             master_addr=master_addr,
             epochs=epochs,
-            output_root=output_root,
+            run_output_root=run_output_root,
         )
-
         print(
             f"\n=== FAN-OUT | CANDIDATO {candidate} "
             f"| RANK {rank} "
@@ -398,12 +597,11 @@ def main():
 
     # Il Fan-in non richiede DDP e viene eseguito una sola volta,
     # sul nodo rank 0, dopo il completamento dei tre rami.
-    
     if rank == 0:
         fan_in_command = build_fan_in_command(
             repo_root=repo_root,
             config=config,
-            output_root=output_root,
+            run_output_root=run_output_root,
         )
 
         print(
@@ -413,7 +611,6 @@ def main():
         print(
             shlex.join(fan_in_command)
         )
-
         if not args.dry_run:
             subprocess.run(
                 fan_in_command,
@@ -426,9 +623,8 @@ def main():
         test_command = build_test_command(
             repo_root=repo_root,
             config=config,
-            output_root=output_root,
+            run_output_root=run_output_root,
         )
-
         print(
             "\n=== FAN-IN COMPLETATO: AVVIO TEST FINALE ==="
         )
