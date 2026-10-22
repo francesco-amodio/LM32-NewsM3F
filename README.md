@@ -1,6 +1,5 @@
 LM32-NewsM3F
 Progetto individuale per il corso di Intelligenza Artificiale Scalabile.
-
 Il progetto realizza un sistema distribuito per la classificazione multi-label di notizie del dataset News-M3F, utilizzando un modello PyTorch addestrato da zero.
 L'esecuzione distribuita utilizza due nodi CPU, PyTorch Distributed Data Parallel (DDP) con backend Gloo e container Docker.
 
@@ -28,8 +27,8 @@ La directory "cache/preprocessed" deve essere copiata anche sul secondo nodo man
 3 - Configurazione dei nodi
 La configurazione distribuita è contenuta in "config/distributed.json".
 Prima dell'esecuzione verificare in particolare:
-– "master\_addr": indirizzo IP del nodo rank 0;
-– "world\_size": numero di nodi;
+– "master_addr": indirizzo IP del nodo rank 0;
+– "world_size": numero di nodi;
 – hostname e rank dei nodi;
 – interfaccia di rete utilizzata da Gloo;
 – batch size locale;
@@ -48,30 +47,30 @@ Il training distribuito viene eseguito all'interno dei container Docker.
 5 - Avvio del workflow distribuito
 Aprire WSL su entrambi i nodi e posizionarsi nella directory del progetto.
 Avviare prima il nodo rank 0:
-"python3 -m src.launch\_distributed"
+"python3 -m src.launch_distributed"
 Poi avviare lo stesso comando sul nodo rank 1:
-"python3 -m src.launch\_distributed"
+"python3 -m src.launch_distributed"
 Il rank 0 genera il nome del run e lo comunica al secondo nodo.
 Ogni esecuzione viene salvata automaticamente in una directory del tipo:
-"outputs/AAAA.MM.GG\_OO.MM.SS/"
+"outputs/AAAA.MM.GG_OO.MM.SS/"
 È possibile aggiungere una descrizione:
-"python3 -m src.launch\_distributed --run-description 'run definitivo'"
+"python3 -m src.launch_distributed --run-description 'run definitivo'"
 ottenendo, ad esempio:
-"outputs/2026.10.22\_17.36.36 - run definitivo/"
+"outputs/2026.10.22_17.36.36 - run definitivo/"
 Per modificare il numero di epoche senza cambiare la configurazione:
-"python3 -m src.launch\_distributed --epochs 1"
+"python3 -m src.launch_distributed --epochs 1"
 
 6 - Workflow
 Il launcher esegue in sequenza tre candidati:
 – A: Binary Cross-Entropy (BCE) non pesata;
-– B: Binary Cross-Entropy (BCE) con "pos\_weight";
+– B: Binary Cross-Entropy (BCE) con "pos_weight";
 – C: Binary Cross-Entropy (BCE) con pesatura attenuata tramite radice quadrata.
 Ogni candidato viene addestrato mediante DDP sui due nodi.
 Al termine dei tre training, il rank 0 esegue il fan-in, seleziona il modello con il migliore Micro-F1 sulla validation e valuta automaticamente il checkpoint selezionato sul test set.
 Gli output del run contengono:
-"candidate\_A/"
-"candidate\_B/"
-"candidate\_C/"
+"candidate_A/"
+"candidate_B/"
+"candidate_C/"
 "selection/"
 "test/"
 
